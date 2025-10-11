@@ -1,9 +1,9 @@
-name: Sync with Upstream
+name: Sync with Upstream and Patch
 
 on:
   schedule:
-    # 每天执行一次，可以根据需要调整
-    - cron: "0 0 * * *"
+    # 每周日 UTC 时间 00:00 执行 (北京时间早上8点)
+    - cron: "0 0 * * 0"
   workflow_dispatch: # 允许手动触发
 
 jobs:
@@ -13,46 +13,58 @@ jobs:
       - name: Checkout Fork
         uses: actions/checkout@v4
         with:
-          # 使用 Personal Access Token (PAT) 以便可以推送到仓库
-          # 前往 https://github.com/settings/tokens/new 创建一个具有 repo 权限的 PAT
-          # 然后在你的 fork 仓库的 Settings > Secrets and variables > Actions 中添加一个名为 PAT 的 secret
           token: ${{ secrets.PAT }}
-          # 确保 fetch-depth: 0 以获取完整的 git 历史
+          # 获取完整的git历史，以便进行比较
           fetch-depth: 0
 
-      - name: Set up Git
+      - name: Set up Git and Upstream Remote
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-
-      - name: Sync with upstream repository
-        run: |
-          # 添加上游仓库的 remote
+          # 添加上游仓库地址
           git remote add upstream https://github.com/wyx2685/V2bX.git
 
-          # 从上游仓库 fetch 最新的 dev_new 分支
+      # --- 核心修改在这里 ---
+      - name: Check for upstream updates
+        id: check_updates
+        run: |
+          # 1. 先从上游仓库拉取最新的信息
           git fetch upstream dev_new
 
-          # 硬重置本地 dev_new 分支到上游的状态，这会丢弃你的 commit，但没关系，我们马上加回来
+          # 2. 计算上游分支比我们本地分支多了多少个commit
+          #    `git rev-list --count dev_new..upstream/dev_new` 会返回一个数字
+          NEW_COMMITS_COUNT=$(git rev-list --count dev_new..upstream/dev_new)
+
+          echo "Found ${NEW_COMMITS_COUNT} new commits from upstream."
+
+          # 3. 如果这个数字大于0，说明有更新。设置一个输出变量供后续步骤使用
+          if [ "$NEW_COMMITS_COUNT" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          else
+            echo "No new updates from upstream. Nothing to do."
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- 只有在检查到更新时，才执行以下步骤 ---
+      - name: Sync, Patch and Push
+        # 使用 if 条件判断，只有上一步的输出 has_updates 为 'true' 时才运行
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          echo "Upstream has updates. Proceeding with sync..."
+          # 硬重置本地分支到上游的状态
           git checkout dev_new
           git reset --hard upstream/dev_new
 
-          # 核心步骤：使用 sed 命令重新将 'with_tailscale' 添加到 workflow 文件中
-          # 这个命令会查找包含特定 tags 的行，并在 gvisor 后面安全地插入 with_tailscale
+          # 重新应用你的修改
+          echo "Applying custom 'with_tailscale' build tag..."
           sed -i 's/\(with_gvisor"\)/\1 with_tailscale"/' .github/workflows/release.yml
 
-          # 检查修改是否成功
-          echo "--- Modified release.yml content ---"
-          cat .github/workflows/release.yml
-          echo "------------------------------------"
+          echo "Verifying patch..."
+          # 检查一下确保修改成功了
+          grep "with_tailscale" .github/workflows/release.yml || (echo "Patch failed!" && exit 1)
+          echo "Patch successfully applied."
 
-          # 添加修改并创建一个新的 commit
+          # 添加修改、提交并强制推送到你的fork
           git add .github/workflows/release.yml
-          # 判断是否真的有文件变动，防止在没有新 commit 时也强制推送
-          if ! git diff --staged --quiet; then
-            git commit -m "chore: Apply custom build tag 'with_tailscale' after upstream sync"
-            # 强制推送到你的 fork，因为我们用了 git reset --hard，历史记录已经改变
-            git push origin dev_new --force
-          else
-            echo "No changes to apply. Branch is up to date."
-          fi
+          git commit -m "chore: Sync from upstream and apply custom 'with_tailscale' tag"
+          git push origin dev_new --force
